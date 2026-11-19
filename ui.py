@@ -188,14 +188,51 @@ def clipboard_cut(widget: Any) -> bool:
         return False
 
 
+def _is_ctk_entry(widget: Any) -> bool:
+    """True when ``widget`` is a customtkinter entry wrapper, not a raw tk.Entry."""
+    return hasattr(widget, "_entry") and hasattr(widget, "_deactivate_placeholder")
+
+
+def _clear_placeholder(widget: Any) -> None:
+    """Remove CustomTkinter's placeholder state before writing real text.
+
+    CustomTkinter 6 stores the placeholder as literal text in the raw
+    ``_entry``. Writing to ``_entry`` directly (as the keycode handler does)
+    therefore appends after the placeholder unless its state is cleared first.
+    """
+    if _is_ctk_entry(widget):
+        try:
+            widget._deactivate_placeholder()
+        except Exception:  # pragma: no cover - version without the helper
+            pass
+
+
 def clipboard_paste(widget: Any) -> bool:
-    """Paste clipboard text into an entry, replacing any active selection."""
+    """Paste clipboard text into an entry, replacing any active selection.
+
+    Works for both a raw ``tk.Entry`` and a ``CTkEntry`` wrapper. For the
+    latter it clears the placeholder state and writes through the wrapper's
+    own ``delete``/``insert`` so no placeholder text can survive the paste.
+    """
     if widget is None:
         return False
     try:
         text = widget.clipboard_get()
     except Exception:
         return False
+
+    # A CTkEntry wrapper owns the placeholder logic: clear it, then replace
+    # the whole content through the wrapper so get() returns exactly the text.
+    if _is_ctk_entry(widget):
+        _clear_placeholder(widget)
+        try:
+            widget.delete(0, "end")
+            widget.insert(0, text)
+            return True
+        except Exception:  # pragma: no cover - widget torn down
+            return False
+
+    # Raw tk.Entry: replace only the active selection, keep the cursor otherwise.
     bounds = _selection_bounds(widget)
     if bounds is not None:
         try:
@@ -317,6 +354,9 @@ def wire_entry_clipboard(entry: Any, root: Any = None, on_change: Any = None,
     global _CLIPBOARD_CLASS_BOUND
     inner = getattr(entry, "_entry", None)
     target = inner if inner is not None else entry
+    # Paste/copy/cut operate on the CTkEntry wrapper so its placeholder state
+    # is honoured; event bindings still go on the raw tk.Entry.
+    text_widget = entry if inner is not None else target
     toplevel = root if root is not None else entry.winfo_toplevel()
 
     # One class binding for the whole interpreter covers every tk.Entry,
@@ -332,7 +372,7 @@ def wire_entry_clipboard(entry: Any, root: Any = None, on_change: Any = None,
             pass
 
     def on_key(event: Any) -> str | None:
-        result = handle_clipboard_key(event, target)
+        result = handle_clipboard_key(event, text_widget)
         if result == "break" and on_change is not None:
             try:
                 on_change()
@@ -343,7 +383,7 @@ def wire_entry_clipboard(entry: Any, root: Any = None, on_change: Any = None,
     target.bind("<Control-KeyPress>", on_key, add="+")
 
     def on_shift_insert(_event: Any) -> str:
-        _paste_and_notify(target, on_change)
+        _paste_and_notify(text_widget, on_change)
         return "break"
 
     target.bind("<Shift-Insert>", on_shift_insert, add="+")
@@ -352,7 +392,7 @@ def wire_entry_clipboard(entry: Any, root: Any = None, on_change: Any = None,
     entry.bind("<Button-1>", lambda _e: _focus_entry(entry), add="+")
     target.bind("<Button-1>", lambda _e: _focus_entry(entry), add="+")
 
-    menu = _make_entry_menu(target, on_change, menu_factory)
+    menu = _make_entry_menu(text_widget, on_change, menu_factory)
     for widget in (entry, target):
         widget.bind("<Button-3>", lambda e, m=menu: _popup_menu(e, m), add="+")
     return menu
@@ -515,14 +555,20 @@ class SettingsDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _build(self) -> None:
-        root = ctk.CTkFrame(
+        # The outer frame owns the neon border and the pinned action bar. All
+        # fields live in a scrollable child, so a long config can never push
+        # the Test / Save / Cancel buttons off the bottom of the dialog.
+        outer = ctk.CTkFrame(
             self, fg_color=SURFACE, corner_radius=18, border_width=2, border_color=NEON_VIOLET
         )
-        root.pack(fill="both", expand=True, padx=12, pady=12)
+        outer.pack(fill="both", expand=True, padx=12, pady=12)
         # Breathing neon border on the dialog itself.
         self._neon = NeonBorder(self, speed=0.004)
-        self._neon.attach(root)
+        self._neon.attach(outer)
         self._neon.start()
+
+        root = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        root.pack(fill="both", expand=True, padx=4, pady=(6, 0))
 
         head = ctk.CTkLabel(
             root, text="⚡  GENERATIVE FILL  ·  SETTINGS",
@@ -567,7 +613,7 @@ class SettingsDialog(ctk.CTkToplevel):
             key_row, text="Paste", width=56, height=28, corner_radius=8,
             fg_color=NEON_VIOLET, hover_color=NEON_MAGENTA, text_color="#ffffff",
             font=ctk.CTkFont(size=10, weight="bold"),
-            command=lambda: _paste_and_notify(self.api_key_entry._entry, self._refresh_provider),
+            command=lambda: _paste_and_notify(self.api_key_entry, self._refresh_provider),
         )
         self.paste_key_btn.pack(side="right", padx=(6, 0))
         if self.cfg.api_key:
@@ -594,32 +640,42 @@ class SettingsDialog(ctk.CTkToplevel):
             wire_entry_clipboard(self.model_entry, root, self._refresh_provider),
         ]
 
-        # The detected provider is shown as a sleek badge pill.
+        # A clear "Detected Provider & Endpoint" status card.
+        status_card = ctk.CTkFrame(
+            root, fg_color=BG, corner_radius=10, border_width=1, border_color=BORDER
+        )
+        status_card.pack(fill="x", padx=18, pady=(12, 0))
+        ctk.CTkLabel(
+            status_card, text="DETECTED PROVIDER & ENDPOINT",
+            text_color=MUTED, font=ctk.CTkFont(size=8, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=12, pady=(8, 2))
         self.provider_badge = ctk.CTkLabel(
-            root, text="", text_color=NEON_CYAN, font=ctk.CTkFont(size=10, weight="bold"),
+            status_card, text="", text_color=NEON_CYAN,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=SURFACE_HI, corner_radius=10, padx=10, pady=3, anchor="w",
         )
-        self.provider_badge.pack(fill="x", padx=18, pady=(8, 0))
+        self.provider_badge.pack(fill="x", padx=12, pady=(0, 4))
+        self.provider_hint = ctk.CTkLabel(
+            status_card, text=self._provider_hint(), text_color=TEXT,
+            font=ctk.CTkFont(size=9), anchor="w", wraplength=400, justify="left",
+        )
+        self.provider_hint.pack(fill="x", padx=12, pady=(0, 10))
         self._refresh_provider()
 
-        self.provider_hint = ctk.CTkLabel(
-            root, text=self._provider_hint(), text_color=MUTED,
-            font=ctk.CTkFont(size=9), anchor="w", wraplength=420, justify="left",
+        # A clear Test / Validation feedback box.
+        feedback = ctk.CTkFrame(
+            root, fg_color=BG, corner_radius=10, border_width=1, border_color=BORDER
         )
-        self.provider_hint.pack(fill="x", padx=18, pady=(6, 0))
-
-        self.test_button = ctk.CTkButton(
-            root, text="Test API", height=30, corner_radius=8,
-            fg_color=NEON_VIOLET, hover_color=NEON_MAGENTA, text_color="#ffffff",
-            font=ctk.CTkFont(size=11, weight="bold"), command=self._test,
-        )
-        self.test_button.pack(fill="x", padx=18, pady=(8, 0))
-
+        feedback.pack(fill="x", padx=18, pady=(10, 0))
+        ctk.CTkLabel(
+            feedback, text="TEST / VALIDATION FEEDBACK",
+            text_color=MUTED, font=ctk.CTkFont(size=8, weight="bold"), anchor="w",
+        ).pack(fill="x", padx=12, pady=(8, 2))
         self.test_result = ctk.CTkLabel(
-            root, text="", text_color=MUTED, font=ctk.CTkFont(size=9),
-            anchor="w", wraplength=420, justify="left",
+            feedback, text="Press Test API to validate your key.", text_color=MUTED,
+            font=ctk.CTkFont(size=10), anchor="w", wraplength=400, justify="left",
         )
-        self.test_result.pack(fill="x", padx=18, pady=(4, 0))
+        self.test_result.pack(fill="x", padx=12, pady=(0, 10))
 
         net = ctk.CTkFrame(root, fg_color="transparent")
         net.pack(fill="x", pady=(12, 0))
@@ -678,11 +734,30 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.message.pack(fill="x", pady=(8, 6))
 
-        ctk.CTkButton(
-            root, text="Save & Reconnect", height=34, corner_radius=8,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff",
+        # Pinned action bar: always visible regardless of scroll position.
+        actions = ctk.CTkFrame(outer, fg_color="transparent")
+        actions.pack(fill="x", padx=14, pady=(4, 12))
+        self.test_btn = ctk.CTkButton(
+            actions, text="Test API", height=34, corner_radius=8,
+            fg_color="transparent", border_width=1, border_color=NEON_CYAN,
+            hover_color=SURFACE_HI, text_color=NEON_CYAN,
+            font=ctk.CTkFont(size=11, weight="bold"), command=self._test,
+        )
+        self.test_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.save_btn = ctk.CTkButton(
+            actions, text="Save", height=34, corner_radius=8,
+            fg_color=NEON_CYAN, hover_color="#00C9AC", text_color="#04121A",
             font=ctk.CTkFont(size=11, weight="bold"), command=self._save,
-        ).pack(fill="x")
+        )
+        self.save_btn.pack(side="left", fill="x", expand=True, padx=4)
+        self.cancel_btn = ctk.CTkButton(
+            actions, text="Cancel", height=34, corner_radius=8,
+            fg_color=SURFACE_HI, hover_color=BORDER, text_color=TEXT,
+            font=ctk.CTkFont(size=11), command=self._close,
+        )
+        self.cancel_btn.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        # Backwards-compatible alias used by older callers and tests.
+        self.test_button = self.test_btn
 
     def _note(self, text: str, color: str = MUTED) -> None:
         self.message.configure(text=text, text_color=color)
@@ -741,7 +816,9 @@ class SettingsDialog(ctk.CTkToplevel):
             self._test_anim_after = None
             return
         try:
-            self.test_button.configure(fg_color=neon_at((i * 0.08) % 1.0))
+            # Animate the outline, not the fill: the Test button is a
+            # transparent neon-outline style and must stay that way.
+            self.test_btn.configure(border_color=neon_at((i * 0.08) % 1.0))
         except Exception:  # pragma: no cover - dialog closed
             return
         self._test_anim_after = self.after(ANIM_MS * 3, self._animate_test_button, i + 1)
@@ -765,7 +842,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def _test_note(self, text: str, color: str = MUTED) -> None:
         self._stop_test_animation()
         try:
-            self.test_button.configure(state="normal", fg_color=NEON_VIOLET)
+            self.test_btn.configure(state="normal", fg_color="transparent", border_color=NEON_CYAN)
             self.test_result.configure(text=text, text_color=color)
         except Exception:  # pragma: no cover - dialog already closed
             pass
@@ -894,9 +971,10 @@ class FillToolbar(ctk.CTk):
 
         self.badge = ctk.CTkLabel(
             row, text="Disconnected", text_color=MUTED,
-            font=ctk.CTkFont(size=11, weight="bold"), anchor="w", width=132,
+            font=ctk.CTkFont(size=11, weight="bold"), anchor="w",
+            justify="left", width=132,
         )
-        self.badge.pack(side="left", padx=(2, 10))
+        self.badge.pack(side="left", padx=(4, 10))
 
         self.pin_btn = ctk.CTkButton(
             row, text="📌", width=28, height=28, corner_radius=8,
@@ -1336,7 +1414,9 @@ class FillToolbar(ctk.CTk):
         )
         visible = bool(message)
         if visible and not self.status_line.winfo_ismapped():
-            self.status_line.pack(fill="x", padx=12, pady=(0, 7))
+            # A little more left inset than right keeps the first glyph clear
+            # of the rounded border; anchor/justify keep it flush-left.
+            self.status_line.pack(fill="x", padx=(14, 12), pady=(0, 7))
             self._fit()
         elif not visible and self.status_line.winfo_ismapped():
             self.status_line.pack_forget()
