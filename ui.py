@@ -140,6 +140,224 @@ def ease_out(t: float) -> float:
     return 1.0 - (1.0 - t) ** 3
 
 
+# -------------------------------------------------------- clipboard / entries
+# Windows virtual keycodes. These are layout-independent: on a Persian (FA)
+# keyboard Ctrl+V arrives as ``Control-ر``, so matching on ``event.keysym``
+# can never work. The physical keycode is still 86.
+VK_C = 67
+VK_X = 88
+VK_V = 86
+VK_A = 65
+
+# ``bind_class`` registers on the whole Tk interpreter, not per toplevel, so
+# the class binding must be installed exactly once for the entire process.
+_CLIPBOARD_CLASS_BOUND = False
+
+
+def _selection_bounds(widget: Any) -> tuple[Any, Any] | None:
+    """Return the entry's selected range, or None when nothing is selected."""
+    try:
+        return widget.index("sel.first"), widget.index("sel.last")
+    except Exception:
+        return None
+
+
+def clipboard_copy(widget: Any) -> bool:
+    bounds = _selection_bounds(widget)
+    if bounds is None:
+        return False
+    try:
+        text = widget.get(*bounds)
+        widget.clipboard_clear()
+        widget.clipboard_append(text)
+        return True
+    except Exception:
+        return False
+
+
+def clipboard_cut(widget: Any) -> bool:
+    if not clipboard_copy(widget):
+        return False
+    bounds = _selection_bounds(widget)
+    if bounds is None:
+        return False
+    try:
+        widget.delete(*bounds)
+        return True
+    except Exception:
+        return False
+
+
+def clipboard_paste(widget: Any) -> bool:
+    """Paste clipboard text into an entry, replacing any active selection."""
+    if widget is None:
+        return False
+    try:
+        text = widget.clipboard_get()
+    except Exception:
+        return False
+    bounds = _selection_bounds(widget)
+    if bounds is not None:
+        try:
+            widget.delete(*bounds)
+        except Exception:  # pragma: no cover - selection vanished mid-call
+            pass
+    try:
+        widget.insert("insert", text)
+        return True
+    except Exception:  # pragma: no cover - widget torn down
+        return False
+
+
+def select_all(widget: Any) -> None:
+    try:
+        widget.select_range(0, "end")
+        widget.icursor("end")
+    except Exception:  # pragma: no cover - widget torn down
+        pass
+
+
+def handle_clipboard_key(event: Any, widget: Any | None = None) -> str | None:
+    """Dispatch a Ctrl+<key> press by physical keycode.
+
+    Returns ``"break"`` when the key was handled so Tk stops propagating it,
+    or None for an unrelated key. The keysym is deliberately ignored.
+    """
+    target = widget if widget is not None else getattr(event, "widget", None)
+    if target is None:
+        return None
+    code = getattr(event, "keycode", 0)
+    if code == VK_V:
+        clipboard_paste(target)
+        return "break"
+    if code == VK_C:
+        clipboard_copy(target)
+        return "break"
+    if code == VK_X:
+        clipboard_cut(target)
+        return "break"
+    if code == VK_A:
+        select_all(target)
+        return "break"
+    return None
+
+
+def _paste_and_notify(widget: Any, on_change: Any = None) -> None:
+    clipboard_paste(widget)
+    if on_change is not None:
+        try:
+            on_change()
+        except Exception:  # pragma: no cover - callback on dead widget
+            pass
+
+
+def _class_shift_insert(event: Any) -> str:
+    """Class-level Shift+Insert paste for any tk.Entry in the app."""
+    clipboard_paste(getattr(event, "widget", None))
+    return "break"
+
+
+def _make_entry_menu(widget: Any, on_change: Any = None,
+                     menu_factory: Any = None) -> Any:
+    """Build the dark-neon right-click menu for an entry."""
+    factory = menu_factory or tk.Menu
+    menu = factory(
+        widget, tearoff=0, bg=SURFACE, fg=TEXT,
+        activebackground=NEON_VIOLET, activeforeground="#ffffff",
+        bd=1, relief="flat",
+    )
+
+    def run(action: Any) -> None:
+        action(widget)
+        if on_change is not None:
+            try:
+                on_change()
+            except Exception:  # pragma: no cover
+                pass
+
+    menu.add_command(label="Paste", command=lambda: run(clipboard_paste))
+    menu.add_command(label="Copy", command=lambda: run(clipboard_copy))
+    menu.add_command(label="Cut", command=lambda: run(clipboard_cut))
+    menu.add_separator()
+    menu.add_command(label="Select All", command=lambda: run(lambda w: select_all(w)))
+    return menu
+
+
+def _popup_menu(event: Any, menu: Any) -> None:
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        try:
+            menu.grab_release()
+        except Exception:  # pragma: no cover
+            pass
+
+
+def _focus_entry(entry: Any) -> None:
+    """Focus an entry immediately, even inside a borderless floating window."""
+    try:
+        entry.focus_force()
+    except Exception:  # pragma: no cover
+        pass
+    inner = getattr(entry, "_entry", None)
+    target = inner if inner is not None else entry
+    try:
+        target.focus_set()
+    except Exception:  # pragma: no cover
+        pass
+
+
+def wire_entry_clipboard(entry: Any, root: Any = None, on_change: Any = None,
+                         menu_factory: Any = None) -> Any:
+    """Install layout-independent clipboard shortcuts on a CTkEntry.
+
+    Covers physical Ctrl+C/X/V/A, Shift+Insert, click-to-focus, and a
+    right-click context menu. Returns the menu so callers keep it alive.
+    """
+    global _CLIPBOARD_CLASS_BOUND
+    inner = getattr(entry, "_entry", None)
+    target = inner if inner is not None else entry
+    toplevel = root if root is not None else entry.winfo_toplevel()
+
+    # One class binding for the whole interpreter covers every tk.Entry,
+    # including entries created later. The per-widget binding below is
+    # belt-and-braces for customtkinter versions that wrap the entry
+    # differently. A handled key returns "break", so the two never both fire.
+    if not _CLIPBOARD_CLASS_BOUND:
+        try:
+            toplevel.bind_class("Entry", "<Control-KeyPress>", handle_clipboard_key, add="+")
+            toplevel.bind_class("Entry", "<Shift-Insert>", _class_shift_insert, add="+")
+            _CLIPBOARD_CLASS_BOUND = True
+        except Exception:  # pragma: no cover - fake root in a test
+            pass
+
+    def on_key(event: Any) -> str | None:
+        result = handle_clipboard_key(event, target)
+        if result == "break" and on_change is not None:
+            try:
+                on_change()
+            except Exception:  # pragma: no cover
+                pass
+        return result
+
+    target.bind("<Control-KeyPress>", on_key, add="+")
+
+    def on_shift_insert(_event: Any) -> str:
+        _paste_and_notify(target, on_change)
+        return "break"
+
+    target.bind("<Shift-Insert>", on_shift_insert, add="+")
+
+    # The toolbar is borderless: an explicit focus is needed on click.
+    entry.bind("<Button-1>", lambda _e: _focus_entry(entry), add="+")
+    target.bind("<Button-1>", lambda _e: _focus_entry(entry), add="+")
+
+    menu = _make_entry_menu(target, on_change, menu_factory)
+    for widget in (entry, target):
+        widget.bind("<Button-3>", lambda e, m=menu: _popup_menu(e, m), add="+")
+    return menu
+
+
 class NeonBorder:
     """Animates a CTkFrame's native border through the neon gradient.
 
@@ -333,7 +551,25 @@ class SettingsDialog(ctk.CTkToplevel):
             return widget
 
         label("API Key", 0)
-        self.api_key_entry = entry(placeholder_text="paste any key: AIza..., sk-..., sk-or-..., hf_..., r8_...", show="•")
+        # One-click paste row: the key field plus a compact neon Paste button.
+        key_row = ctk.CTkFrame(root, fg_color="transparent")
+        key_row.pack(fill="x", padx=18)
+        self.api_key_entry = ctk.CTkEntry(
+            key_row, fg_color=BG, border_color=BORDER, text_color=TEXT,
+            font=ctk.CTkFont(size=11), corner_radius=8,
+            placeholder_text="paste any key: AIza..., sk-..., sk-or-..., hf_..., r8_...",
+            show="•",
+        )
+        self.api_key_entry.pack(side="left", fill="x", expand=True)
+        self.api_key_entry.bind("<FocusIn>", lambda _e: self.api_key_entry.configure(border_color=NEON_CYAN), add="+")
+        self.api_key_entry.bind("<FocusOut>", lambda _e: self.api_key_entry.configure(border_color=BORDER), add="+")
+        self.paste_key_btn = ctk.CTkButton(
+            key_row, text="Paste", width=56, height=28, corner_radius=8,
+            fg_color=NEON_VIOLET, hover_color=NEON_MAGENTA, text_color="#ffffff",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            command=lambda: _paste_and_notify(self.api_key_entry._entry, self._refresh_provider),
+        )
+        self.paste_key_btn.pack(side="right", padx=(6, 0))
         if self.cfg.api_key:
             self.api_key_entry.insert(0, self.cfg.api_key)
         self.api_key_entry.bind("<KeyRelease>", lambda _e: self._refresh_provider())
@@ -349,6 +585,14 @@ class SettingsDialog(ctk.CTkToplevel):
         if self.cfg.model_name:
             self.model_entry.insert(0, self.cfg.model_name)
         self.model_entry.bind("<KeyRelease>", lambda _e: self._refresh_provider())
+
+        # Clipboard support on all three Settings inputs. Keep references to
+        # the menus so Tk does not garbage-collect them.
+        self._entry_menus = [
+            wire_entry_clipboard(self.api_key_entry, root, self._refresh_provider),
+            wire_entry_clipboard(self.base_url_entry, root, self._refresh_provider),
+            wire_entry_clipboard(self.model_entry, root, self._refresh_provider),
+        ]
 
         # The detected provider is shown as a sleek badge pill.
         self.provider_badge = ctk.CTkLabel(
@@ -697,6 +941,7 @@ class FillToolbar(ctk.CTk):
         # the text: a Persian prompt reads better flush right.
         self.prompt_entry.bind("<KeyRelease>", self._on_prompt_changed)
         self.prompt_entry.bind("<<Paste>>", lambda _e: self.after(1, self._on_prompt_changed))
+        self._prompt_menu = wire_entry_clipboard(self.prompt_entry, self, self._on_prompt_changed)
 
         # Hover micro-interactions: a neon fade on the primary actions.
         self._add_glow(self.generate_btn, ACCENT, NEON_MAGENTA)
